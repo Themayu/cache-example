@@ -24,6 +24,8 @@ where
 {
 	value: Mutex<CacheBox<Item>>,
 	source: Arc<Mutex<ItemSource>>,
+
+	lifetime: Duration,
 }
 
 impl<Item, Err, Fut, ItemSource> Cache<Item, ItemSource>
@@ -39,8 +41,9 @@ where
 		assert!(lifetime > 0, "cache cannot expire in the past!");
 		
 		Cache {
-			value: Mutex::new(CacheBox::new(lifetime)),
+			value: Mutex::new(CacheBox::new()),
 			source: Arc::new(Mutex::new(source)),
+			lifetime: lifetime.minutes(),
 		}
 	}
 
@@ -49,9 +52,13 @@ where
 	pub fn with_value(lifetime: i64, value: Item, source: ItemSource) -> Self {
 		assert!(lifetime > 0, "cache cannot expire in the past!");
 
+		let lifetime = lifetime.minutes();
+
 		Cache {
-			value: Mutex::new(CacheBox::with_value(lifetime, value)),
-			source: Arc::new(Mutex::new(source))
+			lifetime,
+
+			value: Mutex::new(CacheBox::with_value(&lifetime, value)),
+			source: Arc::new(Mutex::new(source)),
 		}
 	}
 
@@ -78,7 +85,7 @@ where
 
 		if !value.is_valid() {
 			debug!(expires_at = %value.expires_at, "cache is invalid; updating");
-			value.acquire_value(&mut *source).await?;
+			value.acquire_value(&mut *source, &self.lifetime).await?;
 		};
 
 		// SAFETY: it is not possible to construct a CacheBox<T> in a state
@@ -106,7 +113,7 @@ where
 
 		if !value.is_valid() {
 			debug!(expires_at = %value.expires_at, "cache is invalid; updating");
-			value.acquire_value(&mut *source).await?;
+			value.acquire_value(&mut *source, &self.lifetime).await?;
 		};
 
 		// SAFETY: it is not possible to construct a CacheBox<T> in a state
@@ -128,12 +135,20 @@ where
 	Item: Debug + Clone,
 {
 	fn clone(&self) -> Self {
-		let value = Mutex::new(block_on(self.value.lock()).clone());
 		let source = self.source.clone();
+		let lifetime = self.lifetime.clone();
+		
+		let value = Mutex::new(match self.value.try_lock() {
+			Some(value) => value.clone(),
+			None => {
+				CacheBox::new()
+			},
+		});
 
 		Cache {
 			value,
 			source,
+			lifetime,
 		}
 	}
 }
@@ -150,9 +165,7 @@ where
 	// flag used to indicate whether `item` contains an initialised value, for
 	// drop safety checking.
 	is_initialized: bool,
-
 	expires_at: OffsetDateTime,
-	lifetime: Duration,
 }
 
 impl<Item> CacheBox<Item>
@@ -166,26 +179,22 @@ where
 
 	/// Construct an empty cache slot whose value expires after `lifetime`
 	/// minutes past its creation.
-	fn new(lifetime: i64) -> Self {
+	fn new() -> Self {
 		CacheBox {
 			item: MaybeUninit::uninit(),
 			
 			expires_at: OffsetDateTime::UNIX_EPOCH,
-			lifetime: lifetime.minutes(),
-
 			is_initialized: false,
 		}
 	}
 
 	/// Construct a pre-initialised cache slot with a default value, which
 	/// expires after `lifetime` minutes past its creation.
-	fn with_value(lifetime: i64, value: Item) -> Self {
+	fn with_value(lifetime: &Duration, value: Item) -> Self {
 		CacheBox {
 			item: MaybeUninit::new(value),
-			
-			expires_at: OffsetDateTime::now_utc() + lifetime.minutes(),
-			lifetime: lifetime.minutes(),
 
+			expires_at: OffsetDateTime::now_utc() + *lifetime,
 			is_initialized: true,
 		}
 	}
@@ -230,13 +239,14 @@ where
 	/// cache slot, overwriting the old value if necessary.
 	#[instrument(
 		name = "Acquiring an updated value from the item source",
-		skip(self, source),
+		skip(self, source, lifetime),
 		fields(
 			expired_at = %self.expires_at,
-			lifetime = %self.lifetime,
+			lifetime = %lifetime,
 		),
 	)]
-	async fn acquire_value<Err, Fut, ItemSource>(&mut self, source: &mut ItemSource) -> Result<(), Err>
+	async fn acquire_value<Err, Fut, ItemSource>(&mut self, source: &mut ItemSource, lifetime: &Duration)
+	-> Result<(), Err>
 	where
 		Err: Debug,
 		Fut: Future<Output = Result<Item, Err>>,
@@ -245,6 +255,9 @@ where
 		let value = source().await?;
 
 		self.drop_if_needed();
+
+		// constructing this pointer before calling `drop_if_needed` upsets
+		// miri, as it is invalidated while it is held.
 		let ptr = self.item.as_mut_ptr();
 
 		// SAFETY: we know this pointer is valid, as we just acquired it from
@@ -253,7 +266,7 @@ where
 			ptr::write(ptr, value);
 		}
 
-		self.expires_at = Self::current_datetime() + self.lifetime;
+		self.expires_at = Self::current_datetime() + *lifetime;
 		self.is_initialized = true;
 
 		debug!("cache expiry time updated: {expires_at}", expires_at = self.expires_at);
@@ -304,7 +317,6 @@ where
 {
 	fn clone(&self) -> Self {
 		let expires_at = self.expires_at.clone();
-		let lifetime = self.lifetime.clone();
 		let is_initialized = self.is_initialized;
 
 		let item = {
@@ -328,10 +340,9 @@ where
 
 		CacheBox {
 			item,
-			is_initialized,
 
+			is_initialized,
 			expires_at,
-			lifetime,
 		}
 	}
 }
